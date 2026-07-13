@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Sign in</title></head>
+<body>
+  <form id="login">
+    <label for="user">Username</label>
+    <input id="user" name="user" placeholder="username">
+    <input id="pass" name="pass" type="password" placeholder="password">
+    <select id="role">
+      <option value="viewer">Viewer</option>
+      <option value="admin">Admin</option>
+    </select>
+    <input id="tos" type="checkbox">
+    <button type="button" id="submit">Sign in</button>
+  </form>
+  <div id="result" hidden></div>
+  <script>
+    document.querySelector('#submit').addEventListener('click', () => {
+      const user = document.querySelector('#user').value;
+      const role = document.querySelector('#role').value;
+      const tos = document.querySelector('#tos').checked;
+      const el = document.querySelector('#result');
+      el.hidden = false;
+      el.textContent = tos ? `welcome ${user} (${role})` : 'you must accept the terms';
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+name: quotes-login
+description: 登录一次，把会话存成 auth.json。之后的采集 flow 直接复用，不用每次重登。
+
+browser:
+  save_storage_state: auth.json     # 跑完把 cookie / localStorage 存下来
+
+steps:
+  - goto: https://quotes.toscrape.com/login
+
+  # 密码从环境变量来，永远不要写进 YAML
+  - fill: { selector: "#username", value: "{{ env.QUOTES_USER | default('demo') }}" }
+  - fill: { selector: "#password", value: "{{ env.QUOTES_PASS | default('demo') }}" }
+  - click: { role: button, name: "Login" }
+
+  - assert:
+      selector: "a[href='/logout']"
+      state: visible
+      message: "登录后没看到登出按钮 —— 凭据错了，或者登录页改版了"
+
+  - log: "会话已保存到 auth.json"

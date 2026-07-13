@@ -1,0 +1,44 @@
+name: hacker-news
+description: 抓 Hacker News 前 N 页的帖子，导出 JSON。翻页 + 累加 + 断言的完整示例。
+
+vars:
+  pages: 2
+
+browser:
+  block_resources: [image, font, media]   # 不下载你根本不看的字节
+
+steps:
+  - goto: https://news.ycombinator.com
+
+  - repeat:
+      times: "{{ vars.pages }}"
+      as: page_no
+      steps:
+        - extract:
+            name: stories
+            selector: ".athing.submission"
+            list: true
+            append: true                  # 跨页累加，而不是每页覆盖
+            fields:
+              rank:  { selector: ".rank", cast: int }
+              title: ".titleline > a"
+              url:   { selector: ".titleline > a", type: link }
+              site:  { selector: ".sitestr", default: "news.ycombinator.com" }
+
+        - log: "第 {{ page_no + 1 }} 页，累计 {{ data.stories | length }} 条"
+
+        # 最后一页没有「More」，点不到就跳出
+        - extract: { name: has_more, selector: "a.morelink", type: exists }
+        - break:
+          when: "{{ not data.has_more }}"
+        - click: "a.morelink"
+        - wait_for: ".athing"
+
+  # 结构变了就要立刻知道，而不是安静地导出一个半截文件
+  - assert:
+      expr: "{{ data.stories | length >= 25 }}"
+      message: "抓到的帖子数少于一页，选择器可能已失效"
+
+output:
+  path: "out/hn-{{ now() }}.json"
+  key: stories

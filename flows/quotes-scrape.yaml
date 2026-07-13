@@ -1,0 +1,64 @@
+name: quotes-scrape
+description: while 循环翻页直到没有下一页，导出 CSV。附带二次抓取每位作者的生平。
+
+vars:
+  max_pages: 10
+  with_authors: false     # --var with_authors=true 打开作者详情二次抓取
+
+browser:
+  block_resources: [image, font, media]
+  storage_state: auth.json   # 存在就复用登录态；不存在会被忽略
+
+steps:
+  - goto: https://quotes.toscrape.com/
+
+  - extract: { name: has_next, selector: "li.next a", type: exists }
+
+  - while:
+      cond: "{{ data.has_next }}"
+      max: "{{ vars.max_pages }}"
+      as: page_no
+      steps:
+        - extract:
+            name: quotes
+            selector: ".quote"
+            list: true
+            append: true
+            fields:
+              text:   ".text"
+              author: ".author"
+              about:  { selector: "a[href*='/author/']", type: link }
+              tags:   { selector: ".tag", many: true }
+
+        - log: "第 {{ page_no + 1 }} 页 -> 累计 {{ data.quotes | length }} 条"
+
+        - extract: { name: has_next, selector: "li.next a", type: exists }
+        - click: "li.next a"
+          when: "{{ data.has_next }}"
+
+  - assert:
+      expr: "{{ data.quotes | length > 0 }}"
+      message: "一条都没抓到 —— .quote 选择器可能失效了"
+
+  # 可选的第二轮：进每位作者的详情页
+  - if:
+      cond: "{{ vars.with_authors }}"
+      then:
+        - foreach:
+            in: "{{ data.quotes | map(attribute='about') | unique | list }}"
+            as: author_url
+            steps:
+              - goto: "{{ author_url }}"
+              - extract:
+                  name: authors
+                  append: true
+                  selector: ".author-details"
+                  fields:
+                    name: ".author-title"
+                    born: ".author-born-date"
+                    bio:  ".author-description"
+
+output:
+  path: "out/quotes.csv"
+  format: csv
+  key: quotes
