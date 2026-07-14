@@ -5,6 +5,7 @@ vars:
   pages: 2
 
 browser:
+  provider: cloak
   block_resources: [image, font, media]   # 不下载你根本不看的字节
 
 steps:
