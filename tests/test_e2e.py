@@ -273,3 +273,169 @@ async def test_run_result_serializes(engine, page1):
     payload = json.loads(json.dumps(result.to_dict(), default=str))
     assert payload["status"] == "success"
     assert payload["steps"][0]["action"] == "goto"
+
+
+# -- P1/P2 additions -------------------------------------------------------
+
+
+async def test_run_level_timeout_fails_and_runs_on_failure(engine, page1, tmp_path):
+    marker = tmp_path / "on_failure_ran.json"
+    flow = load_flow(
+        f"""
+        name: slow
+        limits: {{max_duration: 1}}
+        steps:
+          - goto: "{{{{ vars.url }}}}"
+          - sleep: 5000
+        on_failure:
+          - save: {{path: "{marker}", data: {{ran: true}}}}
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "failed"
+    assert "max_duration" in result.error
+    assert marker.exists()  # teardown/on_failure still ran after the timeout cancel
+
+
+async def test_try_does_not_swallow_a_failed_assert(engine, page1):
+    flow = load_flow(
+        """
+        name: sacred
+        steps:
+          - goto: "{{ vars.url }}"
+          - try:
+              steps:
+                - assert: {expr: "{{ 1 == 2 }}"}
+              catch:
+                - set: {caught: true}
+          - set: {reached_end: true}
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "failed"  # assert propagated through try/catch
+    assert "caught" not in result.data and "reached_end" not in result.data
+
+
+async def test_teardown_failure_surfaces_as_a_warning_not_a_lost_run(engine, page1, tmp_path):
+    a_file = tmp_path / "afile"
+    a_file.write_text("x")  # its "subdir" cannot be created -> save_storage_state fails
+    flow = load_flow(
+        f"""
+        name: warn
+        browser:
+          save_storage_state: "{a_file / 'sub' / 'state.json'}"
+        steps:
+          - goto: "{{{{ vars.url }}}}"
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "success"  # a failed side artifact does not fail the run
+    assert any("save_storage_state" in w for w in result.warnings)
+
+
+async def test_while_pagination(engine, page1):
+    flow = load_flow(
+        """
+        name: paginate
+        steps:
+          - goto: "{{ vars.url }}"
+          - extract: {name: has_next, selector: "a.next", type: exists}
+          - while:
+              cond: "{{ data.has_next }}"
+              max: 5
+              steps:
+                - extract:
+                    name: skus
+                    selector: ".item"
+                    list: true
+                    append: true
+                    fields: {sku: {type: attr, attr: data-sku}}
+                - extract: {name: has_next, selector: "a.next", type: exists}
+                - click: "a.next"
+                  when: "{{ data.has_next }}"
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "success", result.error
+    assert [r["sku"] for r in result.data["skus"]] == ["A-1", "A-2", "A-3", "B-1", "B-2"]
+
+
+async def test_save_action_writes_a_file(engine, page1, tmp_path):
+    out = tmp_path / "saved.json"
+    flow = load_flow(
+        f"""
+        name: save
+        steps:
+          - goto: "{{{{ vars.url }}}}"
+          - extract:
+              name: items
+              selector: ".item"
+              list: true
+              fields: {{sku: {{type: attr, attr: data-sku}}}}
+          - save: {{path: "{out}", data: "{{{{ data.items }}}}", format: json}}
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "success", result.error
+    assert json.loads(out.read_text())[0]["sku"] == "A-1"
+    assert str(out) in result.artifacts
+
+
+async def test_csv_serializes_list_cells_as_json(engine, page1, tmp_path):
+    out = tmp_path / "items.csv"
+    flow = load_flow(
+        f"""
+        name: csv
+        steps:
+          - goto: "{{{{ vars.url }}}}"
+          - extract:
+              name: items
+              selector: ".item"
+              list: true
+              fields:
+                sku: {{type: attr, attr: data-sku}}
+                tags: {{selector: ".tag", many: true}}
+        output: {{path: "{out}", format: csv, key: items}}
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "success", result.error
+    row = out.read_text().splitlines()[1]  # A-1 has tags blue, small
+    assert '"[""blue"", ""small""]"' in row  # a JSON array, CSV-quoted — not a python repr
+    import csv as _csv
+
+    parsed = list(_csv.DictReader(out.read_text().splitlines()))
+    assert json.loads(parsed[0]["tags"]) == ["blue", "small"]
+
+
+async def test_fast_path_and_locator_path_are_identical(engine, page1):
+    """CSS list extract (fast path) vs the equivalent xpath (locator fallback) must match."""
+    flow = load_flow(
+        """
+        name: identity
+        steps:
+          - goto: "{{ vars.url }}"
+          - extract:
+              name: css
+              selector: ".item"
+              list: true
+              fields:
+                sku:  {type: attr, attr: data-sku}
+                name: ".name"
+                price: {selector: ".price", cast: float}
+                tags: {selector: ".tag", many: true}
+          - extract:
+              name: xp
+              selector: "xpath=//li[contains(@class,'item')]"
+              list: true
+              fields:
+                sku:  {type: attr, attr: data-sku}
+                name: {selector: {xpath: ".//a[contains(@class,'name')]"}}
+                price: {selector: {xpath: ".//span[contains(@class,'price')]"}, cast: float}
+                tags: {selector: {xpath: ".//span[contains(@class,'tag')]"}, many: true}
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "success", result.error
+    assert result.data["css"] == result.data["xp"]
+    assert result.data["css"][0]["tags"] == ["blue", "small"]

@@ -169,14 +169,29 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8000,
     concurrency: Annotated[int, typer.Option(help="Max runs executing at once.")] = 4,
+    state_dir: Annotated[
+        Path, typer.Option(help="Where run records are persisted.")
+    ] = Path(".pwflow"),
+    loop: Annotated[
+        str, typer.Option(help="Event loop: asyncio (safe for cloak) or uvloop (faster).")
+    ] = "asyncio",
 ) -> None:
-    """Serve the HTTP API."""
+    """Serve the HTTP API.
+
+    The loop defaults to asyncio, not uvloop: CloakBrowser's subprocess pipes hang under
+    uvloop. If no flow uses `provider: cloak`, `--loop uvloop` is a small speedup.
+    """
     import uvicorn
 
     from .server.app import create_app
 
     _setup_logging(False)
-    uvicorn.run(create_app(flows_dir=flows_dir, concurrency=concurrency), host=host, port=port)
+    uvicorn.run(
+        create_app(flows_dir=flows_dir, concurrency=concurrency, state_dir=state_dir),
+        host=host,
+        port=port,
+        loop=loop,
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,40 @@
+name: stealth-scrape
+description: >
+  用 CloakBrowser 采集有反爬保护的站点。跟普通 flow 唯一的区别就是 browser.provider。
+  需要先装：uv sync --extra cloak （首次启动会下载 ~200MB 隐身内核）。
+
+vars:
+  url: https://example.com
+
+browser:
+  provider: cloak            # 换成 playwright 就是普通浏览器；DSL 其余部分完全一样
+
+  # 对付真正的反爬，加住宅代理并让浏览器"像人"。密码从环境变量注入，别写进 YAML：
+  #   export SCRAPE_PROXY_PASS=...
+  # proxy:
+  #   server: http://gateway:8080
+  #   username: myuser
+  #   password: "{{ env.SCRAPE_PROXY_PASS }}"
+
+  headless: false            # 有些站点即使指纹干净也能识别 headless
+  cloak:
+    humanize: true           # 拟人的鼠标曲线 / 键入节奏 / 滚动
+    geoip: true              # 时区、locale、WebRTC 出口 IP 都对齐代理 IP
+    # license_key: "{{ env.CLOAKBROWSER_LICENSE_KEY }}"   # Pro 版最新内核，通常走 env var
+
+steps:
+  - goto: "{{ vars.url }}"
+
+  - extract:
+      name: page
+      fields:
+        title: { selector: "title", type: text }
+        heading: "h1"
+
+  - assert:
+      selector: "h1"
+      state: visible
+      message: "页面没正常加载 —— 可能被拦了，检查代理/指纹"
+
+output:
+  path: "out/stealth-{{ now() }}.json"

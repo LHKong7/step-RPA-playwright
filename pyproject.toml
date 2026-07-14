@@ -15,6 +15,11 @@ dependencies = [
     "uvicorn[standard]>=0.32",
 ]
 
+[project.optional-dependencies]
+# provider: cloak — the CloakBrowser stealth binary. https://github.com/CloakHQ/cloakbrowser
+# `uv sync --extra cloak` (or `uv add cloakbrowser`). The ~200MB binary downloads on first launch.
+cloak = ["cloakbrowser>=0.4"]
+
 [project.scripts]
 pwflow = "pwflow.cli:app"
 

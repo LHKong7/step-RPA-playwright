@@ -37,8 +37,9 @@ steps:
 
 
 @pytest.fixture
-async def client(flows_dir: Path):
-    app = create_app(flows_dir=flows_dir, concurrency=2)
+async def client(flows_dir: Path, tmp_path: Path):
+    # state_dir under tmp so run records never leak between tests or into the repo
+    app = create_app(flows_dir=flows_dir, concurrency=2, state_dir=tmp_path / "state")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         async with app.router.lifespan_context(app):  # starts/stops the browser pool

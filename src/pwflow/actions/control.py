@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import Field
 
-from ..errors import ActionError, BreakLoop, ContinueLoop, StopFlow
+from ..errors import ActionError, AssertionFailed, BreakLoop, ContinueLoop, StopFlow
 from ..executor import run_steps
 from ..models import Step
 from ..registry import action
@@ -139,12 +139,18 @@ class Try(Strict):
 
 @action("try", Try, control=True)
 async def try_(ctx: RunContext, p: Try, step: Step) -> bool:
-    """Run a block; on failure run `catch:` instead of aborting. `error` is in scope there."""
+    """Run a block; on failure run `catch:` instead of aborting. `error` is in scope there.
+
+    `try` recovers from *operational* failures — a missing element, a timeout. It does
+    NOT catch a failed `assert`: an assertion is an invariant the author declared must
+    hold, and it stays fatal everywhere (`optional` cannot swallow it either). To
+    check-and-branch instead of asserting, use `if` over an `extract ... type: exists`.
+    """
     prefix = ctx.current_index
     ok = True
     try:
         await run_steps(ctx, p.steps, prefix=f"{prefix}.try")
-    except (BreakLoop, ContinueLoop, StopFlow):
+    except (BreakLoop, ContinueLoop, StopFlow, AssertionFailed):
         raise
     except Exception as e:  # noqa: BLE001 - that is the point of `try`
         ok = False

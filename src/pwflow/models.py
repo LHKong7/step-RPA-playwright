@@ -166,8 +166,35 @@ class Proxy(Strict):
 Resource = Literal["image", "font", "stylesheet", "media", "script", "xhr", "fetch"]
 
 
+class CloakConfig(Strict):
+    """CloakBrowser-specific knobs (https://github.com/CloakHQ/cloakbrowser).
+
+    Only consulted when ``provider: cloak``. The stealth levers that CloakBrowser has
+    and stock Playwright does not — everything else (``proxy``, ``locale``, ``timezone``,
+    ``headless``) is read from the parent :class:`BrowserConfig`, so a flow moves between
+    providers by flipping one field.
+    """
+
+    humanize: bool = False  # human-like mouse curves, keystroke timing, scroll
+    human_preset: str | None = None  # e.g. "careful" — slower, more deliberate
+    geoip: bool = False  # derive timezone/locale (and WebRTC IP) from the proxy's exit IP
+    # Pro binary. Prefer the CLOAKBROWSER_LICENSE_KEY env var; a `{{ env.X }}` here works too.
+    license_key: str | None = None
+    stealth_args: bool = True  # set false to supply your own --fingerprint flags via `args`
+    extension_paths: list[str] = Field(default_factory=list)
+    args: list[str] = Field(default_factory=list)  # extra Chromium flags
+
+
 class BrowserConfig(Strict):
-    engine: Literal["chromium", "firefox", "webkit"] = "chromium"
+    # `playwright` (default) launches a stock browser and pools it. `cloak` launches a
+    # CloakBrowser stealth binary, one fresh process per run (a shared process shares a
+    # fingerprint seed). `cdp` attaches to a running browser over CDP — a `cloakserve`
+    # container, browserless, or `chrome --remote-debugging-port`.
+    provider: Literal["playwright", "cloak", "cdp"] = "playwright"
+    cdp_url: str | None = None  # required when provider == cdp
+    cloak: CloakConfig = Field(default_factory=CloakConfig)
+
+    engine: Literal["chromium", "firefox", "webkit"] = "chromium"  # provider=playwright only
     headless: bool = True
     slow_mo: int = 0
     viewport: Viewport = Field(default_factory=Viewport)
@@ -191,6 +218,12 @@ class BrowserConfig(Strict):
     trace: bool = False  # write a Playwright trace.zip into the artifacts dir
     record_video: bool = False
 
+    @model_validator(mode="after")
+    def _provider_needs(self) -> BrowserConfig:
+        if self.provider == "cdp" and not self.cdp_url:
+            raise ValueError("`provider: cdp` needs a `cdp_url:` (e.g. http://localhost:9222)")
+        return self
+
 
 class OutputConfig(Strict):
     path: str | None = None  # where to write collected data (templated)
@@ -199,12 +232,20 @@ class OutputConfig(Strict):
     artifacts_dir: str = "artifacts"  # screenshots, traces, videos
 
 
+class Limits(Strict):
+    # Whole-run wall-clock cap. Per-action timeouts bound a single step; this bounds the
+    # *run* — a `while` that keeps finding a next page, a site that stalls forever. Also
+    # bounds a `wait: true` HTTP request, which otherwise hangs as long as the run does.
+    max_duration: int | None = None  # seconds; None = no cap
+
+
 class Flow(Strict):
     name: str
     description: str | None = None
     vars: dict[str, Any] = Field(default_factory=dict)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    limits: Limits = Field(default_factory=Limits)
     steps: list[Step]
     on_failure: list[Step] = Field(default_factory=list)  # cleanup / diagnostics
 

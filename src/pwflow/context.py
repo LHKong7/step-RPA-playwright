@@ -43,6 +43,9 @@ class RunResult:
     steps: list[StepReport] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
     error: str | None = None
+    # non-fatal problems: a `save_storage_state` that failed, a trace that would not stop.
+    # The run still succeeded, but you should know these did not.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def duration_ms(self) -> int:
@@ -55,6 +58,7 @@ class RunResult:
             "status": self.status,
             "duration_ms": self.duration_ms,
             "error": self.error,
+            "warnings": self.warnings,
             "data": self.data,
             "artifacts": self.artifacts,
             "steps": [s.__dict__ for s in self.steps],
@@ -97,27 +101,35 @@ class RunContext:
         self.data: dict[str, Any] = {}
         self.step_outputs: dict[str, Any] = {}
         self.artifacts: list[str] = []
+        self.warnings: list[str] = []
         self.reports: list[StepReport] = []
 
         self._locals: list[dict[str, Any]] = []
         self.started_at = time.time()
         self.current_index = ""  # dotted path of the running step, e.g. "3.1"; for nested reports
 
-    # -- template scope ----------------------------------------------------
-
-    def scope(self) -> dict[str, Any]:
-        merged: dict[str, Any] = {
+        # A stable base for the template scope, built once. `vars`/`data`/`step_outputs`
+        # are live dict references, so mutations show through without a rebuild; `env` is
+        # snapshotted (it does not change mid-run); `flow` is constant. Only `page.url` and
+        # loop locals change per render, so `scope()` only overlays those. This matters
+        # because scope() runs on every template render — once per extracted field.
+        self._scope_base: dict[str, Any] = {
             "vars": self.vars,
             "env": dict(os.environ),
             "data": self.data,
             "steps": self.step_outputs,
             "flow": {
-                "name": self.flow.name,
+                "name": flow.name,
                 "run_id": self.run_id,
                 "artifacts_dir": str(self.artifacts_dir),
             },
-            "page": {"url": self._page_url()},
         }
+
+    # -- template scope ----------------------------------------------------
+
+    def scope(self) -> dict[str, Any]:
+        merged = dict(self._scope_base)  # shallow: 5 keys, all live references
+        merged["page"] = {"url": self._page_url()}
         for frame in self._locals:
             merged.update(frame)
         return merged

@@ -19,6 +19,8 @@ every later step as ``{{ data.stories }}``.
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Literal
 from urllib.parse import urljoin
 
@@ -28,6 +30,8 @@ from pydantic import model_validator
 from ..errors import ActionError
 from ..registry import action
 from ._common import RunContext, Selector, Step, Strict, loc, tmo
+
+log = logging.getLogger("pwflow")
 
 ValueType = Literal[
     "text",  # visible text, whitespace-collapsed
@@ -104,10 +108,7 @@ async def extract(ctx: RunContext, p: Extract, step: Step) -> Any:
             await root.first.wait_for(state="attached", timeout=timeout)
         except Exception:  # noqa: BLE001 - genuinely empty page is a valid outcome
             pass
-        items = await root.all()
-        if p.limit is not None:
-            items = items[: p.limit]
-        records = [await _record(ctx, item, p) for item in items]
+        records = await _list_records(ctx, root, p)
         if p.skip_empty:
             records = [r for r in records if not _is_empty(r)]
         ctx.put_data(p.name, records, append=p.append)
@@ -177,8 +178,6 @@ def _post(ctx: RunContext, value: Any, f: FieldSpec) -> Any:
         if f.type == "link":
             value = urljoin(ctx.page.url, value)
         if f.regex:
-            import re
-
             m = re.search(f.regex, value)
             if not m:
                 return f.default
@@ -211,3 +210,132 @@ def _is_empty(record: Any) -> bool:
     if isinstance(record, dict):
         return all(v in (None, "", [], {}) for v in record.values())
     return record in (None, "", [], {})
+
+
+# --------------------------------------------------------------------------
+# List extraction: a single-evaluate fast path over the per-field locator path.
+#
+# `extract` with `fields` costs one driver round-trip *per field per record* — 30 rows ×
+# 3 fields ≈ 90 round-trips. When every selector is plain CSS, one page.evaluate reads the
+# whole table in a single trip, and Python applies the exact same `_post` (cast/regex/trim/
+# absurl) to the raw strings — so the result is byte-for-byte identical to the locator path.
+#
+# Eligibility is safe by construction: a bare-string selector is what Playwright feeds to
+# its CSS engine anyway, so querySelectorAll is equivalent. Anything else (a SelectorSpec,
+# an xpath `//...`, a `text=`/`role=` engine, a `>>` chain) is not CSS — and if the guess is
+# ever wrong, querySelectorAll throws and we fall back to the locator path transparently.
+# --------------------------------------------------------------------------
+
+_ENGINE_PREFIX = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*=")
+
+_LIST_JS = """
+(args) => {
+  const { listSel, fields, limit } = args;
+  let rows = Array.from(document.querySelectorAll(listSel));
+  if (limit != null) rows = rows.slice(0, limit);
+  const read = (el, f) => {
+    switch (f.type) {
+      case 'text': return el.textContent;
+      case 'html': return el.outerHTML;
+      case 'inner_html': return el.innerHTML;
+      case 'value': return el.value ?? null;
+      case 'attr': return el.getAttribute(f.attr);
+      case 'link': return el.getAttribute('href');
+      default: return null;
+    }
+  };
+  return rows.map(row => {
+    const rec = {};
+    for (const f of fields) {
+      if (f.many) {
+        const els = f.sel ? Array.from(row.querySelectorAll(f.sel)) : [row];
+        rec[f.key] = els.map(el => read(el, f));
+      } else {
+        const el = f.sel ? row.querySelector(f.sel) : row;
+        rec[f.key] = el ? read(el, f) : null;
+      }
+    }
+    return rec;
+  });
+}
+"""
+
+
+def _css(selector: Any) -> str | None:
+    """Return a CSS string iff `selector` is a bare string Playwright treats as CSS."""
+    if not isinstance(selector, str):
+        return None  # a SelectorSpec (role/label/within/...) is never plain CSS
+    s = selector.strip()
+    if not s or s.startswith(("//", "..", "xpath=")) or ">>" in s:
+        return None  # xpath, or a Playwright selector chain
+    if _ENGINE_PREFIX.match(s):
+        return None  # an explicit engine: text= / role= / id= / ...
+    return s
+
+
+def _field_specs(p: Extract) -> list[tuple[str | None, FieldSpec]]:
+    """(name, spec) per output field. name is None for a single-value (no `fields`) list."""
+    if p.fields is None:
+        single = FieldSpec(
+            type=p.type, attr=p.attr, regex=p.regex, cast=p.cast, trim=p.trim, default=p.default
+        )
+        return [(None, single)]
+    return list(p.fields.items())
+
+
+def _fast_eligible(specs: list[tuple[str | None, FieldSpec]]) -> bool:
+    for _, f in specs:
+        if f.type in ("count", "exists"):
+            return False  # a per-record count/exists is not worth compiling; use locators
+        if f.selector is not None and _css(f.selector) is None:
+            return False
+    return True
+
+
+async def _list_records(ctx: RunContext, root: Locator, p: Extract) -> list[Any]:
+    css = _css(p.selector)
+    specs = _field_specs(p)
+    if css is not None and _fast_eligible(specs):
+        try:
+            return await _list_fast(ctx, css, specs, p)
+        except Exception as e:  # noqa: BLE001 - identical result via the locator path
+            log.debug("extract '%s': fast path fell back to locators (%s)", p.name, e)
+
+    items = await root.all()
+    if p.limit is not None:
+        items = items[: p.limit]
+    return [await _record(ctx, item, p) for item in items]
+
+
+async def _list_fast(
+    ctx: RunContext, css: str, specs: list[tuple[str | None, FieldSpec]], p: Extract
+) -> list[Any]:
+    descriptors = [
+        {
+            "key": name or "__value__",
+            "sel": None if f.selector is None else _css(f.selector),
+            "type": f.type,
+            "attr": f.attr,
+            "many": f.many,
+        }
+        for name, f in specs
+    ]
+    raw_records: list[dict] = await ctx.page.evaluate(
+        _LIST_JS, {"listSel": css, "fields": descriptors, "limit": p.limit}
+    )
+
+    out: list[Any] = []
+    if p.fields is None:
+        _, spec = specs[0]
+        out = [_post_raw(ctx, rec["__value__"], spec) for rec in raw_records]
+    else:
+        for rec in raw_records:
+            out.append({name: _post_raw(ctx, rec[name], f) for name, f in specs})
+    return out
+
+
+def _post_raw(ctx: RunContext, raw: Any, f: FieldSpec) -> Any:
+    """Apply the same post-processing the locator path uses to a JS-returned raw value."""
+    if f.many:
+        return [v for v in (_post(ctx, x, f) for x in (raw or [])) if v is not None]
+    return _post(ctx, raw, f)

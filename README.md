@@ -59,13 +59,13 @@ uv run playwright install chromium    # 只装一次
 ## HTTP 服务
 
 ```bash
-uv run pwflow serve --flows-dir flows --port 8000 --concurrency 4
+uv run pwflow serve --flows-dir flows --port 8000 --concurrency 4 --state-dir .pwflow
 ```
 
 | 接口 | 说明 |
 |---|---|
-| `POST /runs` | `{flow: "hacker-news", vars: {...}, wait: true}` 或 `{yaml: "<内联 YAML>"}`。`wait: false` 立即返回 `run_id` |
-| `GET /runs/{id}` | 查询某次运行（状态、数据、每步耗时） |
+| `POST /runs` | `{flow: "hacker-news", vars: {...}, wait: true}` 或 `{yaml: "<内联 YAML>"}`。`wait: false` 立即返回 `run_id`；可带 `timeout`（秒）覆盖整轮上限 |
+| `GET /runs/{id}` | 查询某次运行（状态、数据、warnings、每步耗时） |
 | `GET /runs` | 最近的运行列表 |
 | `GET /flows` | `flows_dir` 下所有 flow 及其校验状态 |
 | `POST /validate` | 只校验不执行 |
@@ -73,6 +73,8 @@ uv run pwflow serve --flows-dir flows --port 8000 --concurrency 4
 | `GET /healthz` | 存活与在跑任务数 |
 
 浏览器进程池随服务常驻，每次 run 只新建一个 `BrowserContext`（独立 cookie/缓存），所以并发运行之间不会串 session，也不用每次付浏览器启动的开销。
+
+**运行记录会落盘**到 `state_dir/runs/<id>.json`（write-through，原子写），内存里只保留最近的有界缓存 —— 长跑不会 OOM，老记录仍能按 id 查回。服务重启后终态运行仍可查；重启时若发现有 run 卡在 `running`/`queued`，会标成 `interrupted`（浏览器状态已丢、无法续跑）。要「至少一次」「重启续跑」这种保证得上外部任务队列，超出本服务范围。
 
 ```bash
 curl -X POST localhost:8000/runs -H 'content-type: application/json' \
@@ -249,13 +251,14 @@ Playwright 每个动作前都会自动等待，所以只有在等一个「你不
 不写 `fields` 就是取单值：`extract: { name: title, selector: "h1" }`。
 `type: count` / `type: exists` 问的是匹配集本身 —— 分页判断就靠它。
 
-**性能**：`extract` 每个字段都要过一次 driver，30 行 × 3 字段 ≈ 90 次往返。行数上千时，改用一次 `evaluate` 在页面里把数据取完再返回，会快一个数量级。
+**性能（自动快路径）**：`list: true` 且选择器全是纯 CSS 字符串时，`extract` 会自动编译成**一次 `page.evaluate`** 把整张表取回，而不是每字段一次 driver 往返。实测 300 行 × 4 字段 **91ms vs 2171ms，约 24 倍**，且结果与逐字段路径逐字节一致。用到 `role:`/`text:`/xpath 等非 CSS 选择器的字段会透明回退到 locator 路径——无需你做任何事。真要手写更复杂的抽取，`evaluate` 动作仍是逃生口。
 
 ### browser
 
 ```yaml
 browser:
-  engine: chromium              # chromium | firefox | webkit
+  provider: playwright          # playwright(默认) | cloak | cdp —— 见下节
+  engine: chromium              # chromium | firefox | webkit（仅 playwright）
   headless: true
   viewport: { width: 1280, height: 800 }
   user_agent: "..."
@@ -265,12 +268,60 @@ browser:
   block_resources: [image, font, stylesheet, media]   # 采集提速的最大杠杆
   storage_state: auth.json      # 复用登录态
   save_storage_state: auth.json # 跑完把 cookie 存回去
-  proxy: { server: "http://...", username: ..., password: ... }
+  proxy: { server: "http://...", username: ..., password: "{{ env.PROXY_PASS }}" }
   trace: false                  # 录 trace.zip，用 playwright show-trace 看
   record_video: false
 ```
 
 登录一次、之后复用：先跑一个只做登录的 flow，配 `save_storage_state: auth.json`；采集 flow 配 `storage_state: auth.json`。
+
+**browser 段支持 `{{ env.X }}` / `{{ vars.x }}`**（在浏览器启动前就渲染），所以代理密码、license key 这类密钥放环境变量，别写进 YAML。
+
+### 反爬 / 隐身浏览器
+
+`provider` 决定这个 flow 用什么浏览器。DSL 其余部分（动作、选择器、extract、断言）**完全不变** —— 换 provider 只改一个字段。
+
+| provider | 是什么 | 何时用 |
+|---|---|---|
+| `playwright` | 普通 Chromium/Firefox/WebKit，进程池复用 | 默认，绝大多数采集 |
+| `cloak` | [CloakBrowser](https://github.com/CloakHQ/cloakbrowser) 隐身内核（66 处 C++ 源码级指纹补丁），每个 run 独立进程 | 目标站有 Cloudflare Turnstile / FingerprintJS 之类的反爬 |
+| `cdp` | 连接一个已在跑的浏览器（cloakserve 容器、browserless、本地 `chrome --remote-debugging-port`） | 浏览器与采集进程分离部署，或复用远端隐身池 |
+
+**`provider: cloak`** —— 先装：`uv sync --extra cloak`（首次启动会下 ~200MB 隐身内核）。
+
+```yaml
+browser:
+  provider: cloak
+  headless: false          # 有些站点即使指纹干净也识别 headless
+  proxy:                   # 对付真正的反爬，配住宅代理
+    server: http://gateway:8080
+    username: myuser
+    password: "{{ env.SCRAPE_PROXY_PASS }}"
+  cloak:
+    humanize: true         # 拟人的鼠标曲线 / 键入节奏 / 滚动
+    geoip: true            # 时区/locale/WebRTC 出口 IP 对齐代理 IP
+    human_preset: careful  # 可选：更慢更"深思熟虑"的动作
+    license_key: "{{ env.CLOAKBROWSER_LICENSE_KEY }}"   # Pro 版最新内核，通常走 env var
+```
+
+两个关键设计：**cloak 的 proxy/locale/timezone 走 launch 层**（编进 binary，而非 context 层的 CDP emulation —— 后者本身就是可被检测的破绽）；**每个 run 起独立进程**，因为 CloakBrowser 每次启动随机生成指纹种子，复用进程等于复用指纹。示例见 `flows/stealth-scrape.yaml`。
+
+**`provider: cdp`** —— 不需要装 cloakbrowser 包，只用 Playwright 自带的 connect。
+
+```yaml
+browser:
+  provider: cdp
+  cdp_url: http://localhost:9222   # 代理由远端 server 配，这里不用再设
+```
+
+起一个 cloakserve 容器再连过去：
+
+```bash
+docker run -d -p 127.0.0.1:9222:9222 cloakhq/cloakbrowser cloakserve --proxy-server=http://proxy:8080
+uv run pwflow run flows/cdp-attach.yaml
+```
+
+**HTTP 服务下的坑**：CloakBrowser 在 uvloop 下 subprocess 管道会挂死，而 `uvicorn[standard]` 默认用 uvloop。所以 `pwflow serve` 默认 `--loop asyncio`。如果你的 flow 全不用 `provider: cloak`，可以 `--loop uvloop` 换一点性能。`provider: cdp` 不受影响（隐身内核跑在容器里，不在服务进程里 spawn）。
 
 ### output
 
@@ -281,6 +332,15 @@ output:
   key: stories             # 只导出 data.stories；不写就导整个 data
   artifacts_dir: artifacts # 截图/trace/视频的落点
 ```
+
+### limits
+
+```yaml
+limits:
+  max_duration: 300        # 秒；整轮墙钟上限
+```
+
+per-action 的 `timeout` 只管单步；`max_duration` 管**整轮** —— 一个 `while` 一直翻到 max、或者某站永远转圈的情况。它同时也给 `wait: true` 的 HTTP 请求兜底（否则请求会一直挂到 run 结束）。超时会走 `on_failure`，错误信息里带 `max_duration`。HTTP 侧还能用 `POST /runs` 的 `timeout` 字段逐次覆盖。
 
 ---
 
@@ -301,6 +361,10 @@ when: "{{ data.has_next | default(false) }}"
 **`extract` 的 `type: link` 会自动转绝对 URL**，`type: attr, attr: href` 不会 —— 后者给你页面里原样的 `/item?id=1`。
 
 **CSV 里的列表字段会序列化成 JSON**（`["a","b"]`），不是 Python repr。
+
+**`try` 不会吞掉失败的 `assert`。** `try/catch` 只从「操作性失败」里恢复（元素没找到、超时）；断言是你声明的不变量，在任何地方都致命（`optional` 也压不住）。要「检查后分支」而非断言，用 `if` 配 `extract ... type: exists`。
+
+**成功的 run 也可能带 `warnings`。** 存 storage_state 失败、trace 停不下来这类副产物问题不会让 run 失败，但会进 `result.warnings` —— 别忽略它，否则你以为会话存了其实没存。
 
 ## 扩展一个自己的动作
 
@@ -345,6 +409,7 @@ src/pwflow/
   executor.py    步骤循环：when / retry / optional / 分派
   engine.py      浏览器池与运行入口
   cli.py         命令行
-  server/app.py  HTTP 服务
+  server/app.py    HTTP 服务
+  server/store.py  运行记录：有界内存 + 落盘 + 重启恢复
   actions/       navigation interaction waits extract assertions control misc
 ```

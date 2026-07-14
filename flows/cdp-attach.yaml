@@ -1,0 +1,19 @@
+name: cdp-attach
+description: >
+  连接一个已经在跑的浏览器（CDP），而不是本地启动。这台可以是 cloakserve 容器、
+  browserless，或本地 `chrome --remote-debugging-port=9222`。
+  起 cloakserve：
+    docker run -d -p 127.0.0.1:9222:9222 cloakhq/cloakbrowser cloakserve
+
+browser:
+  provider: cdp
+  cdp_url: http://localhost:9222     # 代理由远端 server 配置，这里不用再设
+  block_resources: [image, font, media]
+
+steps:
+  - goto: https://example.com
+  - extract: { name: heading, selector: h1 }
+  - assert: { selector: h1, state: visible }
+
+output:
+  path: "out/cdp.json"

@@ -19,6 +19,10 @@ class SelectorError(PwFlowError):
     """A selector could not be turned into a Playwright locator."""
 
 
+class BrowserError(PwFlowError):
+    """A browser could not be launched or attached to (bad provider config, missing dep)."""
+
+
 class ActionError(PwFlowError):
     """An action failed at runtime. Carries the step that raised it."""
 
