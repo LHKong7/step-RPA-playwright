@@ -260,10 +260,18 @@ def _render_browser_config(cfg: BrowserConfig, vars: dict[str, Any]) -> BrowserC
 
 
 def _write_output(ctx: RunContext, flow: Flow) -> None:
-    payload = ctx.data if flow.output.key is None else ctx.data.get(flow.output.key)
-    path = Path(str(ctx.render(flow.output.path)))
+    out = flow.output
+    if out.shape is not None:
+        # Build the caller's own JSON structure: render every template in the shape
+        # against the final scope (data/vars/flow/steps), keeping native types.
+        payload = ctx.render_deep(out.shape)
+    elif out.key is not None:
+        payload = ctx.data.get(out.key)
+    else:
+        payload = ctx.data
+    path = Path(str(ctx.render(out.path)))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(serialize(payload, flow.output.format), encoding="utf-8")
+    path.write_text(serialize(payload, out.format), encoding="utf-8")
     ctx.artifacts.append(str(path))
     log.info("wrote %s", path)
 

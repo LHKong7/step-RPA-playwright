@@ -229,7 +229,20 @@ class OutputConfig(Strict):
     path: str | None = None  # where to write collected data (templated)
     format: Literal["json", "jsonl", "csv"] = "json"
     key: str | None = None  # export only this key of `data` (default: the whole dict)
+    # A custom output structure, built from templates over `data`/`vars`/`flow`. Any nested
+    # dict/list/scalar; every `{{ }}` inside is rendered at write time, so you shape the JSON
+    # the consumer wants instead of dumping the raw `data` dict. Mutually exclusive with `key`.
+    shape: Any = None
     artifacts_dir: str = "artifacts"  # screenshots, traces, videos
+
+    @model_validator(mode="after")
+    def _key_xor_shape(self) -> OutputConfig:
+        if self.key is not None and self.shape is not None:
+            raise ValueError(
+                "output: use `key` (pick one key of data) or `shape` (build a custom "
+                "structure), not both"
+            )
+        return self
 
 
 class Limits(Strict):

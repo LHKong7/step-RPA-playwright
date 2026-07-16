@@ -334,6 +334,30 @@ output:
   artifacts_dir: artifacts # 截图/trace/视频的落点
 ```
 
+默认落盘的就是 `data` 那个扁平字典（或 `key` 选中的一个键）。想要**自己规定 JSON 的形状** —— 加个包裹层、算个汇总字段、把散落的键重组进一个对象 —— 用 `shape`：一段任意嵌套的结构，里面每个 `{{ }}` 在写盘前对最终作用域（`data` / `vars` / `flow` / `steps`）渲染。整串是单个表达式时保留**原生类型**（`count` 是 int，`items` 是 list），所以出来就是干净的结构化 JSON，而不是一堆字符串：
+
+```yaml
+output:
+  path: "out/report.json"
+  shape:
+    flow: "{{ flow.name }}"
+    scraped_at: "{{ now() }}"
+    count: "{{ data.stories | length }}"       # -> 42 (int)
+    titles: "{{ data.stories | map(attribute='title') | list }}"
+    payload:
+      stories: "{{ data.stories }}"            # -> list，整块塞进来
+```
+
+`shape` 与 `key` 二选一（都在决定导出什么，同时给会在加载期报错）。要在流程**中途**按自定义结构落盘，`save` 动作的 `data` 同样支持嵌套模板：
+
+```yaml
+- save:
+    path: "out/summary.json"
+    data:
+      total: "{{ data.stories | length }}"
+      ids:   "{{ data.stories | map(attribute='id') | list }}"
+```
+
 ### limits
 
 ```yaml
