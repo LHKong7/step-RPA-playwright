@@ -136,3 +136,23 @@ async def test_actions_endpoint_exposes_schemas(client):
     assert actions["if"]["control"] is True
     assert actions["assert"]["aliases"] == ["expect"]
     assert "selector" in actions["click"]["params"]["properties"]
+
+
+async def test_metrics_endpoint_is_prometheus_text(client):
+    r = await client.get("/metrics")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "# TYPE pwflow_runs_total counter" in r.text
+
+
+async def test_metrics_reflect_a_completed_run(client, page1_url):
+    from pwflow.metrics import METRICS
+
+    METRICS.reset()
+    await client.post("/runs", json={"flow": "catalogue", "vars": {"url": page1_url}})
+    body = (await client.get("/metrics")).text
+    assert 'pwflow_runs_total{flow="catalogue",status="success"} 1' in body
+    # the flow ran a goto + an extract, so per-action step counters exist
+    assert 'pwflow_steps_total{action="goto",status="ok"}' in body
+    assert 'pwflow_steps_total{action="extract",status="ok"}' in body
+    assert "pwflow_run_duration_seconds_count" in body

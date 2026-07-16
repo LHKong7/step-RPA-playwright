@@ -21,15 +21,18 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field, model_validator
 
 from ..engine import Engine
 from ..errors import FlowLoadError
 from ..loader import load_flow
+from ..metrics import METRICS
 from ..models import Flow
 from ..registry import canonical
 from .store import FileStore, RunRecord
+
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 log = logging.getLogger("pwflow")
 
@@ -182,6 +185,12 @@ def create_app(
     @api.get("/healthz")
     async def healthz() -> dict[str, Any]:
         return {"ok": True, "active_runs": store.active_count()}
+
+    @api.get("/metrics")
+    async def metrics() -> Response:
+        # Prometheus text exposition — point a scraper here. Counters/histograms are
+        # recorded by the engine and executor into the process-wide registry.
+        return Response(content=METRICS.render(), media_type=PROMETHEUS_CONTENT_TYPE)
 
     return api
 

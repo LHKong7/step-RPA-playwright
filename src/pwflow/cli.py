@@ -5,17 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 from rich.console import Console
-from rich.logging import RichHandler
 from rich.table import Table
 
 from .engine import Engine
 from .errors import PwFlowError
 from .loader import dump_schema, load_flow
+from .observability import configure_logging
 from .registry import canonical
 
 app = typer.Typer(
@@ -26,11 +27,16 @@ app = typer.Typer(
 console = Console()
 
 
-def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
+def _log_format(explicit: str | None) -> str:
+    """`--log-format`, else `$PWFLOW_LOG_FORMAT`, else console."""
+    return explicit or os.environ.get("PWFLOW_LOG_FORMAT", "console")
+
+
+def _setup_logging(verbose: bool, fmt: str = "console") -> None:
+    configure_logging(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="%(message)s",
-        handlers=[RichHandler(console=console, show_path=False, show_time=False, markup=False)],
+        fmt=fmt,
+        console=console,
     )
 
 
@@ -58,9 +64,13 @@ def run(
     out: Annotated[Path | None, typer.Option(help="Write the run result JSON here.")] = None,
     trace: Annotated[bool, typer.Option(help="Record a Playwright trace.zip.")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-V")] = False,
+    log_format: Annotated[
+        str | None,
+        typer.Option("--log-format", help="console (default) or json for structured logs."),
+    ] = None,
 ) -> None:
     """Run a flow."""
-    _setup_logging(verbose)
+    _setup_logging(verbose, _log_format(log_format))
     try:
         flow = load_flow(flow_file)
     except PwFlowError as e:
@@ -175,17 +185,24 @@ def serve(
     loop: Annotated[
         str, typer.Option(help="Event loop: asyncio (safe for cloak) or uvloop (faster).")
     ] = "asyncio",
+    log_format: Annotated[
+        str | None,
+        typer.Option("--log-format", help="console (default) or json for structured logs."),
+    ] = None,
 ) -> None:
     """Serve the HTTP API.
 
     The loop defaults to asyncio, not uvloop: CloakBrowser's subprocess pipes hang under
     uvloop. If no flow uses `provider: cloak`, `--loop uvloop` is a small speedup.
+
+    Metrics are exposed at ``GET /metrics`` in Prometheus text format. `--log-format json`
+    emits one structured JSON line per log record, each tagged with its ``run_id``.
     """
     import uvicorn
 
     from .server.app import create_app
 
-    _setup_logging(False)
+    _setup_logging(False, _log_format(log_format))
     uvicorn.run(
         create_app(flows_dir=flows_dir, concurrency=concurrency, state_dir=state_dir),
         host=host,
