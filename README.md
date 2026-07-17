@@ -71,6 +71,7 @@ uv run pwflow serve --flows-dir flows --port 8000 --concurrency 4 --state-dir .p
 | `POST /validate` | 只校验不执行 |
 | `GET /actions` | 动作清单 + 每个动作的 JSON Schema |
 | `GET /healthz` | 存活与在跑任务数 |
+| `GET /metrics` | Prometheus 文本格式的指标（见「可观测性」） |
 
 浏览器进程池随服务常驻，每次 run 只新建一个 `BrowserContext`（独立 cookie/缓存），所以并发运行之间不会串 session，也不用每次付浏览器启动的开销。
 
@@ -80,6 +81,56 @@ uv run pwflow serve --flows-dir flows --port 8000 --concurrency 4 --state-dir .p
 curl -X POST localhost:8000/runs -H 'content-type: application/json' \
   -d '{"flow": "hacker-news", "vars": {"pages": 1}}' | jq '.data.stories[0]'
 ```
+
+---
+
+## 部署（Docker）
+
+```bash
+docker build -t pwflow .
+docker run -d -p 127.0.0.1:8000:8000 \
+  -v "$PWD/flows:/app/flows:ro" \
+  -v pwflow-state:/app/.pwflow \
+  -v "$PWD/out:/app/out" \
+  pwflow
+```
+
+或用 compose（推荐，卷和重启策略都配好了）：
+
+```bash
+docker compose up -d
+```
+
+镜像基于 `python:3.12-slim`，构建时装 Chromium 及其全部系统依赖（`playwright install --with-deps`），以非 root 用户运行。几个部署要点已经内置：
+
+- **CloakBrowser 已打进镜像**（`provider: cloak` 开箱即用）。隐身内核在**构建时预下载**好（~350MB），首个请求不用等下载、运行时也不用联网。想要精简镜像就 `--build-arg WITH_CLOAK=false`，改用下面的 sidecar 方案。
+- **`--no-sandbox` 已设好**。容器里 Chromium 的沙箱缺权限会起不来，镜像里 `PWFLOW_BROWSER_ARGS="--no-sandbox --disable-dev-shm-usage"` 已处理，且**对 playwright 和 cloak 两种 provider 都生效**。本地跑不受影响（这变量默认为空）。
+- **运行记录持久化**。挂 `pwflow-state` 卷到 `/app/.pwflow`，容器重启后历史运行仍可查（RunStore）。
+- **健康检查**。镜像带 `HEALTHCHECK` 打 `/healthz`，编排器能自动判活。
+
+Pro 版最新内核在构建时烤进镜像：`docker build --build-arg CLOAKBROWSER_LICENSE_KEY=cb_xxx .`
+
+### ⚠️ 安全：别裸奔到公网
+
+`POST /runs` 接受**内联 YAML**，而 flow 能导航到任意 URL、在页面跑 JS、并在容器内写文件。**不要把 8000 端口直接暴露到公网。** compose 默认绑 `127.0.0.1` 并建议前置一个带认证的反向代理，或只在可信内网开放。只跑 `flows_dir` 里预置的命名 flow、不接受内联 YAML 的话风险小得多 —— 那就把内联入口在代理层挡掉。
+
+### 隐身浏览器：镜像内 vs sidecar
+
+**镜像内（默认）** —— flow 直接 `provider: cloak` 即可，无需额外容器。**注意镜像里 cloak 只能跑无头（headless）** —— 没装 Xvfb，`headless: false` 起不来。绝大多数采集无头够用。
+
+**sidecar（精简镜像 / 需要 headed 隐身时）** —— 用 `--build-arg WITH_CLOAK=false` 构建精简镜像，另起官方 `cloakserve` 容器（它自带 Xvfb，能 headed），pwflow 通过 `provider: cdp` 连过去：
+
+```bash
+docker compose --profile cloak up -d
+```
+
+```yaml
+browser:
+  provider: cdp
+  cdp_url: http://cloak:9222     # compose 网络内 cloak 服务可达
+```
+
+住宅代理配在 cloakserve 那侧（`docker-compose.yml` 里有注释示例），pwflow 侧不用改。隐身内核和采集进程分离、各自扩缩。
 
 ---
 
@@ -333,6 +384,30 @@ output:
   artifacts_dir: artifacts # 截图/trace/视频的落点
 ```
 
+默认落盘的就是 `data` 那个扁平字典（或 `key` 选中的一个键）。想要**自己规定 JSON 的形状** —— 加个包裹层、算个汇总字段、把散落的键重组进一个对象 —— 用 `shape`：一段任意嵌套的结构，里面每个 `{{ }}` 在写盘前对最终作用域（`data` / `vars` / `flow` / `steps`）渲染。整串是单个表达式时保留**原生类型**（`count` 是 int，`items` 是 list），所以出来就是干净的结构化 JSON，而不是一堆字符串：
+
+```yaml
+output:
+  path: "out/report.json"
+  shape:
+    flow: "{{ flow.name }}"
+    scraped_at: "{{ now() }}"
+    count: "{{ data.stories | length }}"       # -> 42 (int)
+    titles: "{{ data.stories | map(attribute='title') | list }}"
+    payload:
+      stories: "{{ data.stories }}"            # -> list，整块塞进来
+```
+
+`shape` 与 `key` 二选一（都在决定导出什么，同时给会在加载期报错）。要在流程**中途**按自定义结构落盘，`save` 动作的 `data` 同样支持嵌套模板：
+
+```yaml
+- save:
+    path: "out/summary.json"
+    data:
+      total: "{{ data.stories | length }}"
+      ids:   "{{ data.stories | map(attribute='id') | list }}"
+```
+
 ### limits
 
 ```yaml
@@ -341,6 +416,59 @@ limits:
 ```
 
 per-action 的 `timeout` 只管单步；`max_duration` 管**整轮** —— 一个 `while` 一直翻到 max、或者某站永远转圈的情况。它同时也给 `wait: true` 的 HTTP 请求兜底（否则请求会一直挂到 run 结束）。超时会走 `on_failure`，错误信息里带 `max_duration`。HTTP 侧还能用 `POST /runs` 的 `timeout` 字段逐次覆盖。
+
+---
+
+## 可观测性：结构化日志与 metrics
+
+一次采集跑挂了、变慢了、或者 24 台机器里只有 3 台在重试 —— 靠 `print` 是查不出来的。所以引擎在**不改任何 flow** 的前提下，把每次运行和每个步骤都记进了日志和指标。
+
+### 结构化日志
+
+CLI 默认是人读的 Rich 输出；服务或 CI 里想要**一行一个 JSON**（喂给 Loki / CloudWatch / ELK），加 `--log-format json`（或设 `PWFLOW_LOG_FORMAT=json`）：
+
+```bash
+uv run pwflow run flows/hacker-news.yaml --log-format json
+uv run pwflow serve --log-format json
+```
+
+```json
+{"ts": "2026-01-01T12:00:00+00:00", "level": "INFO", "logger": "pwflow", "msg": "run started", "run_id": "a1b2c3d4e5f6", "flow": "hacker-news", "event": "run.start"}
+{"ts": "2026-01-01T12:00:07+00:00", "level": "INFO", "logger": "pwflow", "msg": "run finished", "run_id": "a1b2c3d4e5f6", "flow": "hacker-news", "event": "run.finish", "status": "success", "duration_ms": 6800, "steps": 12}
+```
+
+关键是**每一条日志都带 `run_id` 和 `flow`** —— 服务里几十个 run 在同一个 event loop 上交错跑，靠这两个字段就能把某一次运行的所有日志过滤出来。上下文用 `contextvars` 承载，跨 `await` 不会串。
+
+自己的代码想接进来（比如自定义动作里）：
+
+```python
+import logging
+from pwflow import configure_logging, bind_context
+
+configure_logging(fmt="json")
+log = logging.getLogger("pwflow")
+with bind_context(run_id="...", flow="..."):
+    log.info("captcha solved", extra={"fields": {"provider": "2captcha", "ms": 1400}})
+```
+
+### Metrics
+
+进程内维护一份 Prometheus 指标（零额外依赖，始终开启），服务在 `GET /metrics` 用文本格式暴露，直接指一个 Prometheus 抓过去就行：
+
+```bash
+curl -s localhost:8000/metrics | grep pwflow_runs_total
+```
+
+| 指标 | 类型 | 标签 | 说明 |
+|---|---|---|---|
+| `pwflow_runs_total` | counter | `flow` `status` | 终态运行数 |
+| `pwflow_run_duration_seconds` | histogram | `flow` | 整轮耗时（p50/p95 靠 `histogram_quantile` 查） |
+| `pwflow_active_runs` | gauge | — | 当前在跑的运行数 |
+| `pwflow_steps_total` | counter | `action` `status` | 步骤数（`ok`/`recovered`/`skipped`/`failed`） |
+| `pwflow_step_duration_seconds` | histogram | `action` | 单步耗时 |
+| `pwflow_step_retries_total` | counter | `action` | 重试次数（不含首次尝试） |
+
+这些够回答日常运维问题：哪个 flow 在失败（`pwflow_runs_total{status="failed"}`）、哪个动作在拖后腿或频繁重试（`pwflow_step_retries_total`）、并发是不是打满了（`pwflow_active_runs`）。CLI 一次性运行也在记，只是没有 HTTP 端点去读 —— 需要的话 `from pwflow import METRICS; METRICS.render()`。
 
 ---
 
@@ -356,7 +484,7 @@ when: "{{ data.has_next | default(false) }}"
 
 **`--var` 的值按 JSON 解析，解析失败才当字符串。** `--var pages=3` 是 int，`--var debug=true` 是 bool，`--var name=hn` 是 str。
 
-**控制动作的数值字段可以写模板，叶子动作的参数则是渲染后才校验的。** `while: {max: "{{ vars.n }}"}` 合法。这是「控制动作拿未渲染载荷」的直接后果。
+**数值字段也能写模板。** `while: {max: "{{ vars.n }}"}`、`sleep: "{{ vars.ms }}"` 都合法 —— 即便字段类型是 int。含模板的参数推迟到运行时（渲染后）才做类型校验；字面参数仍在加载期就校验，拼错照样早报错。
 
 **`extract` 的 `type: link` 会自动转绝对 URL**，`type: attr, attr: href` 不会 —— 后者给你页面里原样的 `/item?id=1`。
 
@@ -408,6 +536,8 @@ src/pwflow/
   context.py     运行时状态：page / vars / data / 报告
   executor.py    步骤循环：when / retry / optional / 分派
   engine.py      浏览器池与运行入口
+  metrics.py     进程内 counter/gauge/histogram + Prometheus 文本
+  observability.py 结构化日志：JSON 格式 + run 上下文绑定
   cli.py         命令行
   server/app.py    HTTP 服务
   server/store.py  运行记录：有界内存 + 落盘 + 重启恢复

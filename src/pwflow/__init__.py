@@ -9,11 +9,14 @@ from .context import RunResult, StepReport
 from .engine import Engine, run_flow
 from .errors import ActionError, AssertionFailed, FlowLoadError, PwFlowError
 from .loader import load_flow
+from .metrics import METRICS
 from .models import Flow, Step
+from .observability import bind_context, configure_logging
 from .registry import action
 
 __version__ = "0.1.0"
 __all__ = [
+    "METRICS",
     "ActionError",
     "AssertionFailed",
     "Engine",
@@ -24,6 +27,8 @@ __all__ = [
     "Step",
     "StepReport",
     "action",
+    "bind_context",
+    "configure_logging",
     "load_flow",
     "run_flow",
 ]

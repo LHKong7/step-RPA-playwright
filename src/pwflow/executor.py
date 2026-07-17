@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from .context import RunContext, StepReport
 from .errors import ActionError, AssertionFailed, BreakLoop, ContinueLoop, StopFlow
+from .metrics import observe_step
 from .models import Step
 
 log = logging.getLogger("pwflow")
@@ -31,9 +32,11 @@ async def run_step(ctx: RunContext, step: Step, index: str) -> Any:
     started = time.perf_counter()
 
     if step.when is not None and not ctx.truthy(step.when):
+        duration = _ms(started)
         ctx.reports.append(
-            StepReport(index, step.action, step.label, "skipped", _ms(started))
+            StepReport(index, step.action, step.label, "skipped", duration)
         )
+        observe_step(step.action, "skipped", duration)
         log.debug("[%s] %s skipped (when: %s)", index, step.action, step.when)
         return None
 
@@ -64,19 +67,23 @@ async def run_step(ctx: RunContext, step: Step, index: str) -> Any:
             if step.id:
                 ctx.step_outputs[step.id] = result
             status = "recovered" if attempt > 1 else "ok"
+            duration = _ms(started)
             ctx.reports.append(
-                StepReport(index, step.action, step.label, status, _ms(started), attempt)
+                StepReport(index, step.action, step.label, status, duration, attempt)
             )
+            observe_step(step.action, status, duration, attempt)
             return result
 
     # every attempt failed
     message = _brief(last_error)
+    duration = _ms(started)
     ctx.reports.append(
         StepReport(
             index, step.action, step.label,
-            "failed", _ms(started), max_attempts, error=message,
+            "failed", duration, max_attempts, error=message,
         )
     )
+    observe_step(step.action, "failed", duration, max_attempts)
     if step.optional:
         log.warning("[%s] %s failed but is optional: %s", index, step.action, message)
         return None

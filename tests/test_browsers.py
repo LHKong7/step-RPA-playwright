@@ -86,6 +86,13 @@ def test_cloak_kwargs_full():
     }
 
 
+def test_cloak_kwargs_merge_env_browser_args(monkeypatch):
+    monkeypatch.setenv("PWFLOW_BROWSER_ARGS", "--no-sandbox")
+    c = cfg(provider="cloak", cloak={"args": ["--mute-audio"]})
+    # a container's --no-sandbox is appended to the flow's own cloak args
+    assert _cloak_launch_kwargs(c)["args"] == ["--mute-audio", "--no-sandbox"]
+
+
 def test_proxy_arg_bare_url_vs_dict():
     assert _proxy_arg(Proxy(server="http://p:8080")) == "http://p:8080"
     with_auth = _proxy_arg(Proxy(server="http://p:8080", username="u", password="pw"))
@@ -167,3 +174,21 @@ async def test_playwright_provider_pools_and_is_not_owned(monkeypatch):
     assert a1.owned is False
     assert a1.browser is a2.browser  # reused from the pool
     assert len(launches) == 1  # launched once
+    assert launches[0]["args"] == []  # no extra flags by default
+
+
+async def test_browser_args_env_reaches_the_launcher(monkeypatch):
+    monkeypatch.setenv("PWFLOW_BROWSER_ARGS", "--no-sandbox --disable-dev-shm-usage")
+    launches = []
+
+    class FakeBrowser:
+        def is_connected(self):
+            return True
+
+    async def fake_launch(**kw):
+        launches.append(kw)
+        return FakeBrowser()
+
+    pw = types.SimpleNamespace(chromium=types.SimpleNamespace(launch=fake_launch))
+    await acquire(pw=pw, pool={}, cfg=cfg())
+    assert launches[0]["args"] == ["--no-sandbox", "--disable-dev-shm-usage"]

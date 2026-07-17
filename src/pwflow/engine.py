@@ -26,7 +26,9 @@ from .context import RunContext, RunResult
 from .errors import StopFlow
 from .executor import run_steps
 from .loader import load_flow
+from .metrics import ACTIVE_RUNS, observe_run
 from .models import BrowserConfig, Flow
+from .observability import bind_context
 from .template import render_deep
 
 log = logging.getLogger("pwflow")
@@ -119,6 +121,28 @@ class Engine:
         run_id = run_id or uuid.uuid4().hex[:12]
         artifacts = artifacts_dir or Path(flow.output.artifacts_dir) / run_id
 
+        # Bind run_id + flow onto every log record for the life of the run, so a JSON log
+        # pipeline can filter one run out of many interleaved on the same event loop.
+        with bind_context(run_id=run_id, flow=flow.name):
+            ACTIVE_RUNS.inc()
+            log.info("run started", extra={"fields": {"event": "run.start"}})
+            try:
+                return await self._run_inner(
+                    flow, vars, run_id, artifacts, started, max_duration=flow.limits.max_duration
+                )
+            finally:
+                ACTIVE_RUNS.dec()
+
+    async def _run_inner(
+        self,
+        flow: Flow,
+        vars: dict[str, Any] | None,
+        run_id: str,
+        artifacts: Path,
+        started: float,
+        *,
+        max_duration: int | None,
+    ) -> RunResult:
         merged_vars = {**flow.vars, **(vars or {})}
         cfg = _render_browser_config(flow.browser, merged_vars)
 
@@ -131,7 +155,6 @@ class Engine:
 
         status: str = "success"
         error: str | None = None
-        max_duration = flow.limits.max_duration
         try:
             steps = run_steps(ctx, flow.steps)
             # wait_for cancels the step loop on timeout; teardown stays outside this scope
@@ -162,7 +185,7 @@ class Engine:
         if flow.output.path and status == "success":
             _write_output(ctx, flow)
 
-        return RunResult(
+        result = RunResult(
             run_id=ctx.run_id,
             flow=flow.name,
             status=status,  # type: ignore[arg-type]
@@ -174,6 +197,17 @@ class Engine:
             error=error,
             warnings=ctx.warnings,
         )
+        observe_run(result.flow, result.status, result.duration_ms)
+        log.info(
+            "run finished",
+            extra={"fields": {
+                "event": "run.finish",
+                "status": result.status,
+                "duration_ms": result.duration_ms,
+                "steps": len(result.steps),
+            }},
+        )
+        return result
 
     async def _teardown(
         self, ctx: RunContext, cfg: BrowserConfig, acq: Acquired, artifacts: Path
@@ -226,10 +260,18 @@ def _render_browser_config(cfg: BrowserConfig, vars: dict[str, Any]) -> BrowserC
 
 
 def _write_output(ctx: RunContext, flow: Flow) -> None:
-    payload = ctx.data if flow.output.key is None else ctx.data.get(flow.output.key)
-    path = Path(str(ctx.render(flow.output.path)))
+    out = flow.output
+    if out.shape is not None:
+        # Build the caller's own JSON structure: render every template in the shape
+        # against the final scope (data/vars/flow/steps), keeping native types.
+        payload = ctx.render_deep(out.shape)
+    elif out.key is not None:
+        payload = ctx.data.get(out.key)
+    else:
+        payload = ctx.data
+    path = Path(str(ctx.render(out.path)))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(serialize(payload, flow.output.format), encoding="utf-8")
+    path.write_text(serialize(payload, out.format), encoding="utf-8")
     ctx.artifacts.append(str(path))
     log.info("wrote %s", path)
 

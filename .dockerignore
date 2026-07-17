@@ -1,0 +1,19 @@
+# Keep the build context small and the image clean.
+.venv/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tests/
+out/
+artifacts/
+.pwflow/
+.DS_Store
+*.log
+# Dev-only files; the app does not need them at runtime.
+Dockerfile
+.dockerignore
+docker-compose.yml

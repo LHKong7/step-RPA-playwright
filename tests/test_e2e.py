@@ -225,6 +225,62 @@ async def test_output_is_written(engine, page1, tmp_path):
     assert lines[1] == "A-1,Blue widget"
 
 
+async def test_output_shape_builds_a_custom_structure(engine, page1, tmp_path):
+    out = tmp_path / "report.json"
+    flow = load_flow(
+        f"""
+        name: shaped
+        vars: {{source: catalogue}}
+        steps:
+          - goto: "{{{{ vars.url }}}}"
+          - extract:
+              name: items
+              selector: ".item"
+              list: true
+              fields:
+                sku: {{type: attr, attr: data-sku}}
+                name: ".name"
+        output:
+          path: "{out}"
+          shape:
+            flow: "{{{{ flow.name }}}}"
+            source: "{{{{ vars.source }}}}"
+            count: "{{{{ data.items | length }}}}"
+            names: "{{{{ data.items | map(attribute='name') | list }}}}"
+            payload:
+              items: "{{{{ data.items }}}}"
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "success", result.error
+
+    report = json.loads(out.read_text())
+    assert report["flow"] == "shaped"
+    assert report["source"] == "catalogue"
+    assert report["count"] == 3  # native int, not the string "3"
+    assert report["names"][0] == "Blue widget"
+    assert report["payload"]["items"][0]["sku"] == "A-1"
+    # the custom shape replaces the raw dump: no bare top-level `items`
+    assert "items" not in report
+
+
+async def test_output_key_and_shape_are_mutually_exclusive():
+    from pwflow.errors import FlowLoadError
+
+    with pytest.raises(FlowLoadError, match="not both"):
+        load_flow(
+            """
+            name: bad
+            steps:
+              - goto: "about:blank"
+            output:
+              path: out.json
+              key: items
+              shape: {n: "{{ 1 }}"}
+            """
+        )
+
+
 async def test_on_failure_runs_and_captures_a_screenshot(engine, page1, tmp_path):
     flow = load_flow(
         f"""
@@ -379,6 +435,32 @@ async def test_save_action_writes_a_file(engine, page1, tmp_path):
     assert result.status == "success", result.error
     assert json.loads(out.read_text())[0]["sku"] == "A-1"
     assert str(out) in result.artifacts
+
+
+async def test_save_action_builds_a_custom_structure(engine, page1, tmp_path):
+    out = tmp_path / "wrapped.json"
+    flow = load_flow(
+        f"""
+        name: save-shaped
+        steps:
+          - goto: "{{{{ vars.url }}}}"
+          - extract:
+              name: items
+              selector: ".item"
+              list: true
+              fields: {{sku: {{type: attr, attr: data-sku}}}}
+          - save:
+              path: "{out}"
+              data:
+                total: "{{{{ data.items | length }}}}"
+                skus: "{{{{ data.items | map(attribute='sku') | list }}}}"
+        """
+    )
+    result = await engine.run(flow, vars={"url": page1})
+    assert result.status == "success", result.error
+    saved = json.loads(out.read_text())
+    assert saved["total"] == 3
+    assert saved["skus"] == ["A-1", "A-2", "A-3"]
 
 
 async def test_csv_serializes_list_cells_as_json(engine, page1, tmp_path):
