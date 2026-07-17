@@ -1,0 +1,60 @@
+name: dianshang
+description: >
+  电商采集示例：抓商品列表，再逐个进详情页补价格/描述。
+  演示 sleep 动作 —— 它的正当用途是「礼貌限速」，两次请求之间歇一下别把站点打爆，
+  这种意图你没法用 wait_for 表达。能命名的等待（元素出现、网络空闲）仍优先用 wait_for。
+
+vars:
+  detail_count: 3          # 进详情页的商品数
+  polite_ms: 800           # 每次翻详情页前歇多久（毫秒）
+
+browser:
+  block_resources: [image, font, media]   # 采集不看图，省带宽
+
+steps:
+  - goto: https://webscraper.io/test-sites/e-commerce/allinone
+
+  # sleep 简写就是毫秒；别名是 wait（`wait: 800` 等价）。
+  # 这里等页面上晚加载的小部件安顿一下 —— 属于「说不清具体等什么」的场景，
+  # 能点名的话应该用 wait_for。
+  - sleep: 500
+
+  - extract:
+      name: products
+      selector: ".product-wrapper"
+      list: true
+      fields:
+        name:    { selector: "a.title", type: attr, attr: title }   # 全名在 title 属性里
+        url:     { selector: "a.title", type: link }                # 相对链接自动转绝对
+        price:   { selector: ".price", cast: float }                # "$1310.39" -> 1310.39
+        reviews: { selector: ".ratings .review-count", cast: int }  # "8 reviews" -> 8
+        rating:  { selector: ".ratings p[data-rating]", type: attr, attr: data-rating, cast: int }
+        desc:    ".description"
+
+  - assert:
+      selector: ".product-wrapper"
+      min_count: 3
+      message: "没抓到商品 —— 页面结构可能变了"
+
+  - log: "列表抓到 {{ data.products | length }} 个商品，开始逐个进详情页"
+
+  # 逐个进详情页。sleep 在这里是正当用途：礼貌限速，别对站点连发请求。
+  - foreach:
+      in: "{{ data.products[:vars.detail_count] }}"
+      as: item
+      steps:
+        - sleep: "{{ vars.polite_ms }}"        # 每次翻页前歇一下（可模板化）
+        - goto: "{{ item.url }}"
+        - extract:
+            name: details
+            append: true                       # 跨迭代累加
+            selector: ".product-wrapper"
+            fields:
+              name:  "h4.title"
+              price: { selector: ".price", cast: float }
+              desc:  ".description"
+
+  - assert: "{{ data.details | length == vars.detail_count }}"
+
+output:
+  path: "out/dianshang-{{ now() }}.json"

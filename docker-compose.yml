@@ -1,0 +1,42 @@
+# pwflow service.
+#   docker compose up -d                 # just pwflow (provider: playwright)
+#   docker compose --profile cloak up -d # add a cloakserve sidecar for stealth
+#
+# SECURITY: POST /runs accepts inline YAML, which can navigate anywhere, run page JS,
+# and write files inside the container. Keep the port on a trusted network or behind an
+# authenticating proxy — do not expose 8000 to the public internet as-is.
+
+services:
+  pwflow:
+    build:
+      context: .
+      args:
+        # "true" bundles CloakBrowser into the image so `provider: cloak` runs in-process
+        # (headless). "false" gives a lean image; use the cloak sidecar below over CDP.
+        WITH_CLOAK: "true"
+    image: pwflow:latest
+    ports:
+      - "127.0.0.1:8000:8000"          # bind to loopback; front it with a reverse proxy
+    volumes:
+      - ./flows:/app/flows:ro          # your flow YAMLs, read-only
+      - pwflow-state:/app/.pwflow      # run records survive restarts (RunStore)
+      - ./out:/app/out                 # output files land back on the host
+    restart: unless-stopped
+    shm_size: "1gb"                    # Chromium is memory-hungry; give it real /dev/shm
+    stop_grace_period: 30s             # let in-flight runs finish on shutdown
+
+  # Alternative to in-image cloak: a cloakserve sidecar. Worth it for a lean pwflow image,
+  # or for HEADED stealth (this image bundles Xvfb; in-image cloak only runs headless).
+  # Enable with `--profile cloak`, then point flows at it:
+  #   browser: { provider: cdp, cdp_url: "http://cloak:9222" }
+  # For a residential proxy: command: cloakserve --proxy-server=http://user:pass@host:port
+  cloak:
+    image: cloakhq/cloakbrowser
+    command: cloakserve
+    expose:
+      - "9222"                         # reachable as http://cloak:9222 on the compose network
+    restart: unless-stopped
+    profiles: ["cloak"]
+
+volumes:
+  pwflow-state:

@@ -84,6 +84,56 @@ curl -X POST localhost:8000/runs -H 'content-type: application/json' \
 
 ---
 
+## 部署（Docker）
+
+```bash
+docker build -t pwflow .
+docker run -d -p 127.0.0.1:8000:8000 \
+  -v "$PWD/flows:/app/flows:ro" \
+  -v pwflow-state:/app/.pwflow \
+  -v "$PWD/out:/app/out" \
+  pwflow
+```
+
+或用 compose（推荐，卷和重启策略都配好了）：
+
+```bash
+docker compose up -d
+```
+
+镜像基于 `python:3.12-slim`，构建时装 Chromium 及其全部系统依赖（`playwright install --with-deps`），以非 root 用户运行。几个部署要点已经内置：
+
+- **CloakBrowser 已打进镜像**（`provider: cloak` 开箱即用）。隐身内核在**构建时预下载**好（~350MB），首个请求不用等下载、运行时也不用联网。想要精简镜像就 `--build-arg WITH_CLOAK=false`，改用下面的 sidecar 方案。
+- **`--no-sandbox` 已设好**。容器里 Chromium 的沙箱缺权限会起不来，镜像里 `PWFLOW_BROWSER_ARGS="--no-sandbox --disable-dev-shm-usage"` 已处理，且**对 playwright 和 cloak 两种 provider 都生效**。本地跑不受影响（这变量默认为空）。
+- **运行记录持久化**。挂 `pwflow-state` 卷到 `/app/.pwflow`，容器重启后历史运行仍可查（RunStore）。
+- **健康检查**。镜像带 `HEALTHCHECK` 打 `/healthz`，编排器能自动判活。
+
+Pro 版最新内核在构建时烤进镜像：`docker build --build-arg CLOAKBROWSER_LICENSE_KEY=cb_xxx .`
+
+### ⚠️ 安全：别裸奔到公网
+
+`POST /runs` 接受**内联 YAML**，而 flow 能导航到任意 URL、在页面跑 JS、并在容器内写文件。**不要把 8000 端口直接暴露到公网。** compose 默认绑 `127.0.0.1` 并建议前置一个带认证的反向代理，或只在可信内网开放。只跑 `flows_dir` 里预置的命名 flow、不接受内联 YAML 的话风险小得多 —— 那就把内联入口在代理层挡掉。
+
+### 隐身浏览器：镜像内 vs sidecar
+
+**镜像内（默认）** —— flow 直接 `provider: cloak` 即可，无需额外容器。**注意镜像里 cloak 只能跑无头（headless）** —— 没装 Xvfb，`headless: false` 起不来。绝大多数采集无头够用。
+
+**sidecar（精简镜像 / 需要 headed 隐身时）** —— 用 `--build-arg WITH_CLOAK=false` 构建精简镜像，另起官方 `cloakserve` 容器（它自带 Xvfb，能 headed），pwflow 通过 `provider: cdp` 连过去：
+
+```bash
+docker compose --profile cloak up -d
+```
+
+```yaml
+browser:
+  provider: cdp
+  cdp_url: http://cloak:9222     # compose 网络内 cloak 服务可达
+```
+
+住宅代理配在 cloakserve 那侧（`docker-compose.yml` 里有注释示例），pwflow 侧不用改。隐身内核和采集进程分离、各自扩缩。
+
+---
+
 ## DSL
 
 ### 顶层结构
@@ -434,7 +484,7 @@ when: "{{ data.has_next | default(false) }}"
 
 **`--var` 的值按 JSON 解析，解析失败才当字符串。** `--var pages=3` 是 int，`--var debug=true` 是 bool，`--var name=hn` 是 str。
 
-**控制动作的数值字段可以写模板，叶子动作的参数则是渲染后才校验的。** `while: {max: "{{ vars.n }}"}` 合法。这是「控制动作拿未渲染载荷」的直接后果。
+**数值字段也能写模板。** `while: {max: "{{ vars.n }}"}`、`sleep: "{{ vars.ms }}"` 都合法 —— 即便字段类型是 int。含模板的参数推迟到运行时（渲染后）才做类型校验；字面参数仍在加载期就校验，拼错照样早报错。
 
 **`extract` 的 `type: link` 会自动转绝对 URL**，`type: attr, attr: href` 不会 —— 后者给你页面里原样的 `/item?id=1`。
 

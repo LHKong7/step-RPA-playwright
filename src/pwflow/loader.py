@@ -57,9 +57,28 @@ def bind(steps: list[Step], prefix: str = "steps") -> None:
         where = f"{prefix}[{i}]"
         spec = get_action(step.action)
         step.spec = spec
-        step.parsed = spec.validate(step.raw, where=where)
-        for child_list_name, children in _child_blocks(step):
-            bind(children, prefix=f"{where}.{step.action}.{child_list_name}")
+        if spec.control:
+            # Control actions keep their parsed params for runtime; their own templatable
+            # fields are typed `int | str`, so templates already validate.
+            step.parsed = spec.validate(step.raw, where=where)
+            for child_list_name, children in _child_blocks(step):
+                bind(children, prefix=f"{where}.{step.action}.{child_list_name}")
+        else:
+            # A leaf action's params are rendered and re-validated at runtime, so this
+            # load-time check only catches typos early. Skip it when the payload holds a
+            # template: `sleep.ms: "{{ vars.n }}"` renders to an int at runtime, but
+            # validating the literal string here would wrongly reject it.
+            step.parsed = None if _has_template(step.raw) else spec.validate(step.raw, where=where)
+
+
+def _has_template(value: Any) -> bool:
+    if isinstance(value, str):
+        return "{{" in value
+    if isinstance(value, dict):
+        return any(_has_template(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_template(v) for v in value)
+    return False
 
 
 def _child_blocks(step: Step) -> list[tuple[str, list[Step]]]:

@@ -40,6 +40,30 @@ def test_missing_required_param():
         load_flow("name: t\nsteps:\n  - fill: {selector: '#a'}\n")
 
 
+def test_templated_non_string_leaf_field_loads():
+    """`sleep.ms` is an int, but `sleep: "{{ vars.n }}"` renders to one at runtime —
+    the loader must not reject it just because the literal is a template string."""
+    flow = load_flow(
+        """
+        name: t
+        vars: {n: 800}
+        steps:
+          - sleep: "{{ vars.n }}"
+          - foreach:
+              in: "{{ vars.items }}"
+              steps:
+                - sleep: "{{ vars.n }}"
+        """
+    )
+    assert flow.steps[0].action == "sleep"
+
+
+def test_typo_still_caught_when_params_are_literal():
+    # deferring templated params must not weaken typo-catching for literal payloads
+    with pytest.raises(FlowLoadError, match="Extra inputs"):
+        load_flow("name: t\nsteps:\n  - sleep: {ms: 100, msec: 200}\n")
+
+
 def test_two_action_keys_in_one_step():
     with pytest.raises(FlowLoadError, match="exactly one action key"):
         load_flow("name: t\nsteps:\n  - click: .a\n    goto: https://x.com\n")

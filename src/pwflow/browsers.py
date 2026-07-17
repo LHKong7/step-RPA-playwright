@@ -16,6 +16,8 @@ module answers per acquisition:
 from __future__ import annotations
 
 import logging
+import os
+import shlex
 from dataclasses import dataclass, field
 
 from playwright.async_api import Browser, Playwright
@@ -43,13 +45,25 @@ async def acquire(pw: Playwright, pool: dict[tuple, Browser], cfg: BrowserConfig
     raise BrowserError(f"unknown provider {cfg.provider!r}")  # pragma: no cover
 
 
+def _launch_args() -> list[str]:
+    """Process-wide extra browser flags from ``PWFLOW_BROWSER_ARGS`` (space-separated).
+
+    This is how a container passes ``--no-sandbox --disable-dev-shm-usage``: Chromium's
+    sandbox needs privileges most container runtimes withhold, so without these it simply
+    fails to launch. Empty by default, so a normal local run is unaffected.
+    """
+    return shlex.split(os.environ.get("PWFLOW_BROWSER_ARGS", ""))
+
+
 async def _playwright(pw: Playwright, pool: dict[tuple, Browser], cfg: BrowserConfig) -> Acquired:
     """A stock browser, launched once per (engine, headless, slow_mo) and reused."""
     key = (cfg.engine, cfg.headless, cfg.slow_mo)
     browser = pool.get(key)
     if browser is None or not browser.is_connected():
         launcher = getattr(pw, cfg.engine)
-        browser = pool[key] = await launcher.launch(headless=cfg.headless, slow_mo=cfg.slow_mo)
+        browser = pool[key] = await launcher.launch(
+            headless=cfg.headless, slow_mo=cfg.slow_mo, args=_launch_args()
+        )
         log.debug("launched %s (headless=%s)", cfg.engine, cfg.headless)
     return Acquired(browser, owned=False)
 
@@ -94,8 +108,11 @@ def _cloak_launch_kwargs(cfg: BrowserConfig) -> dict:
         kwargs["stealth_args"] = False
     if c.extension_paths:
         kwargs["extension_paths"] = c.extension_paths
-    if c.args:
-        kwargs["args"] = c.args
+    # cloak's own flags plus the process-wide ones (so a container's --no-sandbox reaches
+    # the stealth binary too — it is Chromium, and its sandbox needs the same privileges).
+    combined_args = [*c.args, *_launch_args()]
+    if combined_args:
+        kwargs["args"] = combined_args
     return kwargs
 
 
